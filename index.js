@@ -58,13 +58,71 @@ const REPOS = [
   },
 ];
 
-const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const PROVIDER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;  // re-fetch provider JS every 6h
+const STREAM_CACHE_TTL_MS   = 30 * 60 * 1000;       // cache stream results for 30min
+const STREAM_CACHE_MAX      = 500;                   // max entries before LRU eviction
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let providers    = null;
 let stremioMeta  = null;
 let lastLoad     = 0;
 let loadPromise  = null;
+
+// ─── Stream result cache ──────────────────────────────────────────────────────
+// Map of cacheKey → { streams, expiresAt, hits }
+// Also used as a dedup guard: if a fetch is in-flight, concurrent requests for
+// the same title wait on the same Promise instead of each firing their own scrape.
+const streamCache = new Map();
+let cacheStats = { hits: 0, misses: 0, evictions: 0 };
+
+function makeCacheKey(type, id) {
+  return `${type}::${id}`;
+}
+
+function cacheGet(key) {
+  const entry = streamCache.get(key);
+  if (!entry) return null;
+  if (entry.promise) return entry.promise;   // in-flight — return the Promise
+  if (Date.now() > entry.expiresAt) {
+    streamCache.delete(key);
+    return null;
+  }
+  entry.hits++;
+  cacheStats.hits++;
+  return entry.streams;
+}
+
+function cacheSetInflight(key, promise) {
+  streamCache.set(key, { promise });
+}
+
+function cacheSetResult(key, streams) {
+  // Evict oldest 10% if over max
+  if (streamCache.size >= STREAM_CACHE_MAX) {
+    const toEvict = [...streamCache.entries()]
+      .filter(([, v]) => !v.promise)
+      .sort((a, b) => a[1].expiresAt - b[1].expiresAt)
+      .slice(0, Math.ceil(STREAM_CACHE_MAX * 0.1));
+    for (const [k] of toEvict) { streamCache.delete(k); cacheStats.evictions++; }
+  }
+  streamCache.set(key, { streams, expiresAt: Date.now() + STREAM_CACHE_TTL_MS, hits: 0 });
+  cacheStats.misses++;
+}
+
+function cacheClearInflight(key) {
+  const entry = streamCache.get(key);
+  if (entry?.promise) streamCache.delete(key);
+}
+
+// Sweep expired entries every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  let removed = 0;
+  for (const [k, v] of streamCache) {
+    if (!v.promise && now > v.expiresAt) { streamCache.delete(k); removed++; }
+  }
+  if (removed) console.log(`🧹  Cache sweep: removed ${removed} expired, ${streamCache.size} active`);
+}, 10 * 60 * 1000);
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 function httpGet(url, headers = {}, timeoutMs = 25000) {
@@ -395,9 +453,9 @@ async function loadAll() {
   return { loaded, meta };
 }
 
-// ─── Cache management ─────────────────────────────────────────────────────────
+// ─── Provider cache management ────────────────────────────────────────────────
 async function ensureProviders() {
-  if (providers && (Date.now() - lastLoad) < CACHE_TTL_MS) return;
+  if (providers && (Date.now() - lastLoad) < PROVIDER_CACHE_TTL_MS) return;
   if (loadPromise) return loadPromise;
 
   loadPromise = loadAll()
@@ -438,43 +496,69 @@ function parseId(type, id) {
   return { tmdbId, mediaType: type === 'series' ? 'tv' : 'movie', season, episode };
 }
 
-// ─── Query providers ──────────────────────────────────────────────────────────
+// ─── Query providers (with cache + in-flight dedup) ───────────────────────────
 async function getStreams(type, id) {
+  const key = makeCacheKey(type, id);
+
+  // 1. Cache hit or in-flight dedup
+  const cached = cacheGet(key);
+  if (cached !== null) {
+    if (cached instanceof Promise) {
+      // Another request is already scraping this title — wait for it
+      console.log(`⏳  ${type}/${id} — waiting on in-flight scrape`);
+      return cached;
+    }
+    console.log(`⚡  ${type}/${id} — cache hit (${streamCache.get(key)?.hits} hits)`);
+    return cached;
+  }
+
+  // 2. Cache miss — start scraping, register in-flight promise immediately
   const { tmdbId, mediaType, season, episode } = parseId(type, id);
   console.log(`🔍  ${mediaType} | ${tmdbId} | S${season??'-'}E${episode??'-'} | ${providers.length} providers`);
 
-  const results = await Promise.allSettled(
-    providers.map(p =>
-      Promise.race([
-        p.getStreams(tmdbId, mediaType, season, episode),
-        new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 25000)),
-      ])
-    )
-  );
+  const scrapePromise = (async () => {
+    const results = await Promise.allSettled(
+      providers.map(p =>
+        Promise.race([
+          p.getStreams(tmdbId, mediaType, season, episode),
+          new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 25000)),
+        ])
+      )
+    );
 
-  const streams = [];
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.status === 'rejected') continue;
-    for (const s of (r.value || [])) {
-      if (!s?.url) continue;
-      const stream = {
-        name  : s.name  || providers[i].meta.name,
-        title : [s.title, s.quality, s.size].filter(Boolean).join(' · ') || '',
-        url   : s.url,
-      };
-      if (s.headers && Object.keys(s.headers).length) {
-        stream.behaviorHints = {
-          notWebReady  : true,
-          proxyHeaders : { request: s.headers },
+    const streams = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === 'rejected') continue;
+      for (const s of (r.value || [])) {
+        if (!s?.url) continue;
+        const stream = {
+          name  : s.name  || providers[i].meta.name,
+          title : [s.title, s.quality, s.size].filter(Boolean).join(' · ') || '',
+          url   : s.url,
         };
+        if (s.headers && Object.keys(s.headers).length) {
+          stream.behaviorHints = {
+            notWebReady  : true,
+            proxyHeaders : { request: s.headers },
+          };
+        }
+        streams.push(stream);
       }
-      streams.push(stream);
     }
-  }
 
-  console.log(`  → ${streams.length} stream(s)\n`);
-  return streams;
+    // Promote from in-flight → cached result
+    cacheSetResult(key, streams);
+    console.log(`  → ${streams.length} stream(s) | cache: ${streamCache.size} entries, ${cacheStats.hits} hits / ${cacheStats.misses} misses\n`);
+    return streams;
+  })().catch((e) => {
+    cacheClearInflight(key);
+    throw e;
+  });
+
+  // Register in-flight so concurrent requests share this promise
+  cacheSetInflight(key, scrapePromise);
+  return scrapePromise;
 }
 
 // ─── HTTP server ──────────────────────────────────────────────────────────────
@@ -500,6 +584,35 @@ const server = http.createServer(async (req, res) => {
   if (url === '/') {
     res.writeHead(200, { 'Content-Type':'text/plain' });
     res.end('Nuvio Mega Bridge — add /manifest.json to Stremio');
+    return;
+  }
+
+  // Cache stats endpoint
+  if (url === '/cache') {
+    const now = Date.now();
+    const entries = [...streamCache.entries()]
+      .filter(([, v]) => !v.promise)
+      .map(([k, v]) => ({
+        key      : k,
+        hits     : v.hits,
+        expiresIn: Math.round((v.expiresAt - now) / 1000) + 's',
+      }))
+      .sort((a, b) => b.hits - a.hits);
+
+    json(res, 200, {
+      summary: {
+        totalEntries  : streamCache.size,
+        cacheHits     : cacheStats.hits,
+        cacheMisses   : cacheStats.misses,
+        evictions     : cacheStats.evictions,
+        hitRate       : cacheStats.hits + cacheStats.misses > 0
+                          ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
+                          : '0%',
+        ttlMinutes    : STREAM_CACHE_TTL_MS / 60000,
+        maxEntries    : STREAM_CACHE_MAX,
+      },
+      topEntries: entries.slice(0, 20),
+    });
     return;
   }
 
