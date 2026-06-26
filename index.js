@@ -25,6 +25,18 @@ const PROVIDER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // reload provider JS every 
 const STREAM_CACHE_TTL_MS   = 24 * 60 * 60 * 1000;  // cache stream results 24h
 const STREAM_CACHE_MAX      = 500;
 
+// ─── Remote Stremio addons ────────────────────────────────────────────────────
+// These are fully-built Stremio addons running on external servers.
+// We proxy stream requests to them and merge results with our local providers.
+// Add more by appending { name, base } entries.
+const REMOTE_ADDONS = [
+  {
+    name : 'HdHub',
+    base : 'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9',
+    types: ['movie', 'series'],
+  },
+];
+
 // ─── State ────────────────────────────────────────────────────────────────────
 let providers    = null;
 let stremioMeta  = null;
@@ -301,7 +313,7 @@ function loadAllProviders() {
     id          : 'community.nuvio.mega.bridge',
     version     : '2.0.0',
     name        : 'Nuvio Mega Bridge',
-    description : `${loaded.length} providers from 6 repos — all bundled locally`,
+    description : `${loaded.length} local providers + ${REMOTE_ADDONS.length} remote addon(s) — 6 repos bundled locally`,
     logo        : 'https://raw.githubusercontent.com/yoruix/nuvio-providers/main/Assets/Logo-2.png',
     resources   : ['stream'],
     types       : types.length ? types : ['movie','series'],
@@ -336,6 +348,36 @@ function parseId(type, id) {
   return { tmdbId, mediaType: type==='series'?'tv':'movie', season, episode };
 }
 
+// ─── Fetch streams from remote Stremio addons ─────────────────────────────────
+async function fetchRemoteStreams(type, rawId) {
+  if (!REMOTE_ADDONS.length) return [];
+
+  const results = await Promise.allSettled(
+    REMOTE_ADDONS
+      .filter(a => a.types.includes(type))
+      .map(async (addon) => {
+        const url = `${addon.base}/stream/${type}/${encodeURIComponent(rawId)}.json`;
+        try {
+          const text = await httpGet(url, {}, 20000);
+          const data = safeJson(text);
+          const streams = (data?.streams || []).map(s => ({
+            name  : s.name  || addon.name,
+            title : s.title || s.description || '',
+            url   : s.url,
+            ...(s.behaviorHints ? { behaviorHints: s.behaviorHints } : {}),
+          })).filter(s => s.url);
+          console.log(`  🌐  ${addon.name}: ${streams.length} stream(s)`);
+          return streams;
+        } catch (e) {
+          console.warn(`  ⚠️  ${addon.name}: ${e.message}`);
+          return [];
+        }
+      })
+  );
+
+  return results.flatMap(r => r.status === 'fulfilled' ? r.value : []);
+}
+
 // ─── Query providers (cached + in-flight dedup) ───────────────────────────────
 async function getStreams(type, id) {
   const key    = makeCacheKey(type, id);
@@ -354,18 +396,24 @@ async function getStreams(type, id) {
   console.log(`🔍  ${mediaType} | ${tmdbId} | S${season??'-'}E${episode??'-'} | ${providers.length} providers`);
 
   const scrapePromise = (async () => {
-    const results = await Promise.allSettled(
-      providers.map(p =>
-        Promise.race([
-          p.getStreams(tmdbId, mediaType, season, episode),
-          new Promise((_,rej) => setTimeout(()=>rej(new Error('timeout')), 25000)),
-        ])
-      )
-    );
+    // Query local providers AND remote addons in parallel
+    const [localResults, remoteStreams] = await Promise.all([
+      Promise.allSettled(
+        providers.map(p =>
+          Promise.race([
+            p.getStreams(tmdbId, mediaType, season, episode),
+            new Promise((_,rej) => setTimeout(()=>rej(new Error('timeout')), 25000)),
+          ])
+        )
+      ),
+      fetchRemoteStreams(type, id),
+    ]);
 
     const streams = [];
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
+
+    // Collect local provider results
+    for (let i = 0; i < localResults.length; i++) {
+      const r = localResults[i];
       if (r.status==='rejected') continue;
       for (const s of (r.value||[])) {
         if (!s?.url) continue;
@@ -380,6 +428,9 @@ async function getStreams(type, id) {
         streams.push(stream);
       }
     }
+
+    // Append remote addon results
+    streams.push(...remoteStreams);
 
     cacheSetResult(key, streams);
     const total   = cacheStats.hits + cacheStats.misses;
@@ -413,7 +464,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url==='/') {
     res.writeHead(200,{'Content-Type':'text/plain'});
-    res.end(`Nuvio Mega Bridge v2 — ${providers?.length??0} providers loaded\nAdd to Stremio: /manifest.json`);
+    res.end(`Nuvio Mega Bridge v2 — ${providers?.length??0} local providers + ${REMOTE_ADDONS.length} remote addon(s)\nAdd to Stremio: /manifest.json`);
     return;
   }
 
