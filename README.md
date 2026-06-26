@@ -1,39 +1,51 @@
-# Nuvio Mega Bridge
+# Nuvio Mega Bridge v2 — Local Edition
 
-One Stremio addon pulling from **6 Nuvio repos** — deduplicated automatically.
+82 providers from 6 repos, all bundled locally at deploy time. No GitHub dependency at runtime.
+
+## What changed from v1
+
+| | v1 (remote) | v2 (local) |
+|---|---|---|
+| Provider source | Fetched from GitHub on every startup | Downloaded once at build time |
+| Startup time | 30–60 seconds | **~2 seconds** |
+| Reliability | Breaks if any GitHub repo goes down | **Always works** |
+| Updates | Auto (could break unexpectedly) | Manual (you control it) |
+| Railway cold start | Very slow | **Fast** |
 
 ## Repos included
 
-| Priority | Repo | Author | Providers |
-|---|---|---|---|
-| 1 | All-in-One-Nuvio | D3adlyRocket | 58 |
-| 2 | Asura Synthesis | PirateZoro9 | 13 |
-| 3 | Yoru's Repo | yoruix | ~26 |
-| 4 | Phisher's Repo | phisher98 | 2 |
-| 5 | Michat88 Repo | michat88 | 29 |
-| 6 | Ray's Plugins | hihihihihiiray | 20 |
+| Priority | Repo | Author |
+|---|---|---|
+| 1 | All-in-One-Nuvio | D3adlyRocket |
+| 2 | Asura Synthesis | PirateZoro9 |
+| 3 | Yoru's Repo | yoruix |
+| 4 | Phisher's Repo | phisher98 |
+| 5 | Michat88 Repo | michat88 |
+| 6 | Ray's Plugins | hihihihihiiray |
 
-New unique providers from Ray's repo: **AniNeko, BollyFlix, Embed69, FaselHD, FilmModu, HindMoviez, Movix, TokyoInsider, VidFast**
-
-When the same provider appears in multiple repos, the highest-priority repo wins (order above).
-
----
-
-## Deploy to Railway (you already have an account)
+## Deploy to Railway
 
 ### 1. Push to GitHub
 
-Create a new repo (e.g. `nuvio-mega-bridge`), upload these 3 files:
-- `index.js`
-- `package.json`
-- `README.md`
+Create a new repo and push these files:
+```
+index.js
+build.js
+package.json
+provider-list.json
+.gitignore
+README.md
+```
 
-### 2. Deploy on Railway
+**Do not push the `providers/` folder** — it's in `.gitignore` and gets created by the build step.
 
-- Go to your Railway dashboard → **New Project** → **Deploy from GitHub repo**
-- Select `nuvio-mega-bridge`
-- Railway auto-detects Node and runs `npm start`
-- Go to **Settings → Networking → Generate Domain**
+### 2. Configure Railway build command
+
+In Railway → your service → **Settings → Build**:
+- **Build Command:** `npm run build`
+- **Start Command:** `npm start`
+
+Railway will run `node build.js` first (downloads all 82 provider files), then `node index.js`.
 
 ### 3. Add to Stremio
 
@@ -41,20 +53,23 @@ Create a new repo (e.g. `nuvio-mega-bridge`), upload these 3 files:
 https://your-app.up.railway.app/manifest.json
 ```
 
-Paste that in Stremio → Add-ons → URL bar → Install. Works on iOS, Android, desktop, TV — everything.
+## Updating providers
 
----
+When upstream repos push fixes, to update:
+1. Redeploy on Railway (triggers `npm run build` again → re-downloads all providers)
+2. Or manually: `node build.js` locally, commit the updated `providers/*.js` files
 
-## How deduplication works
+## Cache stats
 
-1. Manifests are fetched from all 5 repos in parallel on startup
-2. Providers are added in priority order — first repo to claim an ID wins
-3. Lower-priority repos only contribute providers with **new IDs** not seen yet
-4. All unique providers load concurrently in batches of 6
-5. Provider JS files are cached in memory for 6 hours, then refreshed
+Visit `/cache` on your deployment to see live cache stats:
+```
+https://your-app.up.railway.app/cache
+```
 
----
+Shows hit rate, entries, TTL remaining per title.
 
-## Zero dependencies
+## Cache settings
 
-Uses only Node.js built-ins (`http`, `https`, `vm`, `crypto`). No `npm install` needed.
+In `index.js`:
+- `STREAM_CACHE_TTL_MS` — how long stream results are cached (default: 24h)
+- `STREAM_CACHE_MAX` — max cached entries before eviction (default: 500)

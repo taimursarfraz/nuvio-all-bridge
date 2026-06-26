@@ -1,103 +1,54 @@
 'use strict';
 
 /**
- * Nuvio Mega Bridge — Stremio Addon
+ * Nuvio Mega Bridge — Local Edition
  *
- * Merges providers from 6 Nuvio repos into one Stremio addon.
- * Deduplicates by provider ID, using repo priority order.
+ * Providers are bundled locally (downloaded at build time by build.js).
+ * No GitHub dependency at runtime — fast startup, always reliable.
  *
- * Repos (in priority order — first one wins for duplicate IDs):
- *   1. All-in-One-Nuvio   (D3adlyRocket)
- *   2. Asura Synthesis     (PirateZoro9)
- *   3. Yoru's Repo         (yoruix)
- *   4. Phisher's Repo      (phisher98)
- *   5. Michat88 Repo       (michat88)
- *   6. Ray's Plugins       (hihihihihiiray)
- *
- * Deploy to Railway / Render, then add to Stremio:
- *   https://your-app.railway.app/manifest.json
+ * 82 providers from 6 repos:
+ *   All-in-One-Nuvio (D3adlyRocket) · Asura Synthesis (PirateZoro9)
+ *   Yoru's Repo (yoruix) · Phisher's Repo (phisher98)
+ *   Michat88 Repo (michat88) · Ray's Plugins (hihihihihiiray)
  */
 
 const http  = require('http');
 const https = require('https');
+const fs    = require('fs');
+const path  = require('path');
 const vm    = require('vm');
 
-const PORT = process.env.PORT || 3000;
+const PORT           = process.env.PORT || 3000;
+const PROVIDERS_DIR  = path.join(__dirname, 'providers');
 
-// ─── Source repos (priority order — first wins on duplicate IDs) ──────────────
-const REPOS = [
-  {
-    name : "All-in-One-Nuvio",
-    base : "https://raw.githubusercontent.com/D3adlyRocket/All-in-One-Nuvio/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/D3adlyRocket/All-in-One-Nuvio/refs/heads/main/manifest.json",
-  },
-  {
-    name : "Asura Synthesis",
-    base : "https://raw.githubusercontent.com/PirateZoro9/asura-providers/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/PirateZoro9/asura-providers/refs/heads/main/manifest.json",
-  },
-  {
-    name : "Yoru's Repo",
-    base : "https://raw.githubusercontent.com/yoruix/nuvio-providers/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/yoruix/nuvio-providers/refs/heads/main/manifest.json",
-  },
-  {
-    name : "Phisher's Repo",
-    base : "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json",
-  },
-  {
-    name : "Michat88 Repo",
-    base : "https://raw.githubusercontent.com/michat88/nuvio-providers/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/michat88/nuvio-providers/refs/heads/main/manifest.json",
-  },
-  {
-    name : "Ray's Plugins",
-    base : "https://raw.githubusercontent.com/hihihihihiiray/plugins/refs/heads/main",
-    manifestUrl: "https://raw.githubusercontent.com/hihihihihiiray/plugins/refs/heads/main/manifest.json",
-  },
-];
-
-const PROVIDER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;  // re-fetch provider JS every 6h
-const STREAM_CACHE_TTL_MS   = 30 * 60 * 1000;       // cache stream results for 30min
-const STREAM_CACHE_MAX      = 500;                   // max entries before LRU eviction
+const PROVIDER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // reload provider JS every 6h
+const STREAM_CACHE_TTL_MS   = 24 * 60 * 60 * 1000;  // cache stream results 24h
+const STREAM_CACHE_MAX      = 500;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let providers    = null;
 let stremioMeta  = null;
 let lastLoad     = 0;
-let loadPromise  = null;
 
 // ─── Stream result cache ──────────────────────────────────────────────────────
-// Map of cacheKey → { streams, expiresAt, hits }
-// Also used as a dedup guard: if a fetch is in-flight, concurrent requests for
-// the same title wait on the same Promise instead of each firing their own scrape.
 const streamCache = new Map();
 let cacheStats = { hits: 0, misses: 0, evictions: 0 };
 
-function makeCacheKey(type, id) {
-  return `${type}::${id}`;
-}
+function makeCacheKey(type, id) { return `${type}::${id}`; }
 
 function cacheGet(key) {
   const entry = streamCache.get(key);
   if (!entry) return null;
-  if (entry.promise) return entry.promise;   // in-flight — return the Promise
-  if (Date.now() > entry.expiresAt) {
-    streamCache.delete(key);
-    return null;
-  }
+  if (entry.promise) return entry.promise;
+  if (Date.now() > entry.expiresAt) { streamCache.delete(key); return null; }
   entry.hits++;
   cacheStats.hits++;
   return entry.streams;
 }
 
-function cacheSetInflight(key, promise) {
-  streamCache.set(key, { promise });
-}
+function cacheSetInflight(key, promise) { streamCache.set(key, { promise }); }
 
 function cacheSetResult(key, streams) {
-  // Evict oldest 10% if over max
   if (streamCache.size >= STREAM_CACHE_MAX) {
     const toEvict = [...streamCache.entries()]
       .filter(([, v]) => !v.promise)
@@ -110,35 +61,32 @@ function cacheSetResult(key, streams) {
 }
 
 function cacheClearInflight(key) {
-  const entry = streamCache.get(key);
-  if (entry?.promise) streamCache.delete(key);
+  const e = streamCache.get(key);
+  if (e?.promise) streamCache.delete(key);
 }
 
-// Sweep expired entries every 10 minutes
 setInterval(() => {
-  const now = Date.now();
-  let removed = 0;
+  const now = Date.now(); let removed = 0;
   for (const [k, v] of streamCache) {
     if (!v.promise && now > v.expiresAt) { streamCache.delete(k); removed++; }
   }
   if (removed) console.log(`🧹  Cache sweep: removed ${removed} expired, ${streamCache.size} active`);
 }, 10 * 60 * 1000);
 
-// ─── HTTP helper ──────────────────────────────────────────────────────────────
+// ─── HTTP helper (used by providers at runtime) ───────────────────────────────
 function httpGet(url, headers = {}, timeoutMs = 25000) {
   return new Promise((resolve, reject) => {
-    const lib  = url.startsWith('https') ? https : http;
-    const req  = lib.get(url, { headers, timeout: timeoutMs }, (res) => {
-      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, { headers, timeout: timeoutMs }, (res) => {
+      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location)
         return httpGet(res.headers.location, headers, timeoutMs).then(resolve, reject);
-      }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode} — ${url}`));
       }
       const buf = [];
-      res.on('data',  c => buf.push(c));
-      res.on('end',   () => resolve(Buffer.concat(buf).toString('utf-8')));
+      res.on('data', c => buf.push(c));
+      res.on('end',  () => resolve(Buffer.concat(buf).toString('utf-8')));
       res.on('error', reject);
     });
     req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout — ${url}`)); });
@@ -146,183 +94,134 @@ function httpGet(url, headers = {}, timeoutMs = 25000) {
   });
 }
 
-function safeJson(text) {
-  try { return JSON.parse(text); } catch (_) { return null; }
-}
+function safeJson(text) { try { return JSON.parse(text); } catch (_) { return null; } }
 
 // ─── Module shims ─────────────────────────────────────────────────────────────
 const CHEERIO_SHIM = (() => {
   const empty = () => {
-    const node = () => node;
-    Object.assign(node, {
-      text: () => '', html: () => '', attr: () => null, val: () => null,
-      find: () => node, first: () => node, last: () => node, eq: () => node,
-      filter: () => node, children: () => node, parent: () => node, parents: () => node,
-      closest: () => node, next: () => node, prev: () => node, siblings: () => node,
-      each: (_fn) => node, map: (_fn) => ({ get: () => [] }), toArray: () => [],
-      is: () => false, hasClass: () => false, length: 0,
-      toString: () => '',
+    const n = () => n;
+    return Object.assign(n, {
+      text:()=>'', html:()=>'', attr:()=>null, val:()=>null,
+      find:()=>n, first:()=>n, last:()=>n, eq:()=>n,
+      filter:()=>n, children:()=>n, parent:()=>n, parents:()=>n,
+      closest:()=>n, next:()=>n, prev:()=>n, siblings:()=>n,
+      each:()=>n, map:()=>({get:()=>[]}), toArray:()=>[],
+      is:()=>false, hasClass:()=>false, length:0, toString:()=>'',
     });
-    return node;
   };
-  const load = (_html) => {
-    const $ = (sel) => empty();
-    $.load = load;
-    return $;
-  };
+  const load = () => { const $=()=>empty(); $.load=load; return $; };
   return { load };
 })();
 
 const CRYPTOJS_SHIM = (() => {
-  const nodeCrypto = require('crypto');
-
-  function wordsToBuffer(wordArray) {
-    const words  = wordArray.words || [];
-    const bytes  = wordArray.sigBytes != null ? wordArray.sigBytes : words.length * 4;
-    const buf    = Buffer.alloc(bytes);
-    for (let i = 0; i < bytes; i++) {
-      buf[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff;
+  const nc = require('crypto');
+  function toBuffer(v) {
+    if (!v) return Buffer.alloc(16);
+    if (Buffer.isBuffer(v)) return v;
+    if (typeof v === 'string') return Buffer.from(v, 'utf8');
+    if (v.words) {
+      const b = Buffer.alloc(v.sigBytes ?? v.words.length * 4);
+      for (let i = 0; i < b.length; i++) b[i] = (v.words[i>>2] >>> (24-(i%4)*8)) & 0xff;
+      return b;
     }
-    return buf;
+    return Buffer.from(String(v));
   }
-
-  function toBuffer(val, encoding = 'utf8') {
-    if (!val) return Buffer.alloc(16);
-    if (Buffer.isBuffer(val)) return val;
-    if (typeof val === 'string') return Buffer.from(val, encoding);
-    if (val.words) return wordsToBuffer(val);
-    return Buffer.from(String(val));
-  }
-
-  const enc = {
-    Utf8  : { stringify: (w) => wordsToBuffer(w).toString('utf8'),   parse: (s) => { const b = Buffer.from(s,'utf8');   return { words: [...b].reduce((a,v,i) => { if(i%4===0)a.push(0); a[a.length-1]|=(v<<(24-i%4*8)); return a; },[]), sigBytes:b.length }; } },
-    Base64: { stringify: (w) => wordsToBuffer(w).toString('base64'), parse: (s) => { const b = Buffer.from(s,'base64'); return { words: [...b].reduce((a,v,i) => { if(i%4===0)a.push(0); a[a.length-1]|=(v<<(24-i%4*8)); return a; },[]), sigBytes:b.length }; } },
-    Hex   : { stringify: (w) => wordsToBuffer(w).toString('hex'),    parse: (s) => { const b = Buffer.from(s,'hex');    return { words: [...b].reduce((a,v,i) => { if(i%4===0)a.push(0); a[a.length-1]|=(v<<(24-i%4*8)); return a; },[]), sigBytes:b.length }; } },
-    Latin1: { stringify: (w) => wordsToBuffer(w).toString('latin1'), parse: (s) => { const b = Buffer.from(s,'latin1'); return { words: [...b].reduce((a,v,i) => { if(i%4===0)a.push(0); a[a.length-1]|=(v<<(24-i%4*8)); return a; },[]), sigBytes:b.length }; } },
-  };
-
   const wordResult = (buf) => {
     const words = [];
     for (let i = 0; i < buf.length; i += 4) words.push(buf.readUInt32BE(i));
-    return { words, sigBytes: buf.length, toString: (e) => (e||enc.Hex).stringify({ words, sigBytes: buf.length }) };
+    const wa = { words, sigBytes: buf.length };
+    wa.toString = (e) => (e||enc.Hex).stringify(wa);
+    return wa;
   };
-
-  const tryAes = (algo, keyBuf, ivBuf, dataBuf, decrypt = true) => {
-    try {
-      const fn = decrypt
-        ? nodeCrypto.createDecipheriv(algo, keyBuf, ivBuf)
-        : nodeCrypto.createCipheriv(algo, keyBuf, ivBuf);
-      fn.setAutoPadding(true);
-      return wordResult(Buffer.concat([fn.update(dataBuf), fn.final()]));
-    } catch (_) {
-      return wordResult(Buffer.alloc(0));
-    }
+  const enc = {
+    Utf8  :{ stringify:(w)=>toBuffer(w).toString('utf8'),   parse:(s)=>wordResult(Buffer.from(s,'utf8'))   },
+    Base64:{ stringify:(w)=>toBuffer(w).toString('base64'), parse:(s)=>wordResult(Buffer.from(s,'base64')) },
+    Hex   :{ stringify:(w)=>toBuffer(w).toString('hex'),    parse:(s)=>wordResult(Buffer.from(s,'hex'))    },
+    Latin1:{ stringify:(w)=>toBuffer(w).toString('latin1'), parse:(s)=>wordResult(Buffer.from(s,'latin1')) },
   };
-
   return {
     enc,
-    lib: { WordArray: { create: (arr, sigBytes) => ({ words: arr||[], sigBytes: sigBytes||0, toString: (e) => (e||enc.Hex).stringify({words:arr||[],sigBytes:sigBytes||0}) }) } },
-    AES: {
-      decrypt: (ciphertext, key, opts = {}) => {
+    lib:{ WordArray:{ create:(a,s)=>wordResult(Buffer.from(a??[])) } },
+    AES:{
+      decrypt:(cipher,key,opts={})=>{
         try {
-          const algo    = 'aes-256-cbc';
-          const keyBuf  = toBuffer(key).slice(0,32).length < 32
-                          ? Buffer.concat([toBuffer(key), Buffer.alloc(32)]).slice(0,32)
-                          : toBuffer(key).slice(0,32);
-          const ivBuf   = opts.iv ? toBuffer(opts.iv).slice(0,16) : Buffer.alloc(16);
-          const rawData = typeof ciphertext === 'string'
-                          ? Buffer.from(ciphertext,'base64')
-                          : (ciphertext.ciphertext ? toBuffer(ciphertext.ciphertext) : toBuffer(ciphertext));
-          const result  = tryAes(algo, keyBuf, ivBuf, rawData, true);
-          return result;
-        } catch (_) { return wordResult(Buffer.alloc(0)); }
+          const k  = Buffer.concat([toBuffer(key),Buffer.alloc(32)]).slice(0,32);
+          const iv = opts.iv ? toBuffer(opts.iv).slice(0,16) : Buffer.alloc(16);
+          const d  = typeof cipher==='string' ? Buffer.from(cipher,'base64') : toBuffer(cipher.ciphertext??cipher);
+          const dec = nc.createDecipheriv('aes-256-cbc',k,iv);
+          dec.setAutoPadding(true);
+          return wordResult(Buffer.concat([dec.update(d),dec.final()]));
+        } catch(_){ return wordResult(Buffer.alloc(0)); }
       },
-      encrypt: (msg, key, opts = {}) => {
-        try {
-          const keyBuf  = Buffer.concat([toBuffer(key), Buffer.alloc(32)]).slice(0,32);
-          const ivBuf   = opts.iv ? toBuffer(opts.iv).slice(0,16) : nodeCrypto.randomBytes(16);
-          const result  = tryAes('aes-256-cbc', keyBuf, ivBuf, toBuffer(msg), false);
-          return { ciphertext: result, toString: () => result.toString(enc.Base64) };
-        } catch (_) { return { toString: () => '' }; }
-      },
+      encrypt:(msg,key,opts={})=>{ return { toString:()=>'' }; },
     },
-    MD5    : (s) => wordResult(Buffer.from(nodeCrypto.createHash('md5').update(toBuffer(s)).digest())),
-    SHA256 : (s) => wordResult(Buffer.from(nodeCrypto.createHash('sha256').update(toBuffer(s)).digest())),
-    SHA1   : (s) => wordResult(Buffer.from(nodeCrypto.createHash('sha1').update(toBuffer(s)).digest())),
-    SHA512 : (s) => wordResult(Buffer.from(nodeCrypto.createHash('sha512').update(toBuffer(s)).digest())),
-    HmacMD5   : (msg, key) => wordResult(Buffer.from(nodeCrypto.createHmac('md5',   toBuffer(key)).update(toBuffer(msg)).digest())),
-    HmacSHA256: (msg, key) => wordResult(Buffer.from(nodeCrypto.createHmac('sha256',toBuffer(key)).update(toBuffer(msg)).digest())),
-    HmacSHA512: (msg, key) => wordResult(Buffer.from(nodeCrypto.createHmac('sha512',toBuffer(key)).update(toBuffer(msg)).digest())),
-    RC4: { encrypt: () => ({ toString: () => '' }), decrypt: () => wordResult(Buffer.alloc(0)) },
-    pad: { Pkcs7: {}, NoPadding: {} },
-    mode: { CBC: {}, ECB: {}, CTR: {} },
+    MD5    :(s)=>wordResult(nc.createHash('md5').update(toBuffer(s)).digest()),
+    SHA256 :(s)=>wordResult(nc.createHash('sha256').update(toBuffer(s)).digest()),
+    SHA1   :(s)=>wordResult(nc.createHash('sha1').update(toBuffer(s)).digest()),
+    SHA512 :(s)=>wordResult(nc.createHash('sha512').update(toBuffer(s)).digest()),
+    HmacMD5   :(m,k)=>wordResult(nc.createHmac('md5',   toBuffer(k)).update(toBuffer(m)).digest()),
+    HmacSHA256:(m,k)=>wordResult(nc.createHmac('sha256',toBuffer(k)).update(toBuffer(m)).digest()),
+    HmacSHA512:(m,k)=>wordResult(nc.createHmac('sha512',toBuffer(k)).update(toBuffer(m)).digest()),
+    pad:{ Pkcs7:{}, NoPadding:{} }, mode:{ CBC:{}, ECB:{}, CTR:{} },
+    RC4:{ encrypt:()=>({toString:()=>''}), decrypt:()=>wordResult(Buffer.alloc(0)) },
   };
 })();
 
 const AXIOS_SHIM = (() => {
   const request = async (config) => {
-    const url    = typeof config === 'string' ? config : (config.url || '');
-    const method = (config?.method || 'GET').toUpperCase();
-    const hdrs   = config?.headers || {};
-    const tout   = config?.timeout || 25000;
-
-    if (method === 'GET') {
+    const url    = typeof config==='string' ? config : (config?.url||'');
+    const method = (config?.method||'GET').toUpperCase();
+    const hdrs   = config?.headers||{};
+    const tout   = config?.timeout||25000;
+    if (method==='GET') {
       const text = await httpGet(url, hdrs, tout);
-      return { data: safeJson(text) ?? text, status: 200, headers: {}, statusText: 'OK' };
+      return { data: safeJson(text)??text, status:200, headers:{}, statusText:'OK' };
     }
-
-    // POST/PUT/etc
-    const text = await new Promise((resolve, reject) => {
-      const u   = new URL(url);
-      const lib = u.protocol === 'https:' ? https : http;
-      const body = config?.data
-        ? (typeof config.data === 'string' ? config.data : JSON.stringify(config.data))
-        : '';
-      const opts = {
-        hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname + u.search, method,
-        headers: { 'Content-Type':'application/json','Content-Length':Buffer.byteLength(body), ...hdrs },
-        timeout: tout,
-      };
-      const req = lib.request(opts, (res) => {
-        const buf = [];
-        res.on('data', c => buf.push(c));
-        res.on('end', () => resolve(Buffer.concat(buf).toString('utf-8')));
-        res.on('error', reject);
+    const body = config?.data ? (typeof config.data==='string' ? config.data : JSON.stringify(config.data)) : '';
+    const text = await new Promise((resolve,reject) => {
+      const u = new URL(url);
+      const lib = u.protocol==='https:' ? https : http;
+      const req = lib.request({
+        hostname:u.hostname, port:u.port||(u.protocol==='https:'?443:80),
+        path:u.pathname+u.search, method,
+        headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),...hdrs},
+        timeout:tout,
+      }, (res) => {
+        const buf=[];
+        res.on('data',c=>buf.push(c));
+        res.on('end',()=>resolve(Buffer.concat(buf).toString('utf-8')));
+        res.on('error',reject);
       });
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-      req.on('error', reject);
+      req.on('timeout',()=>{req.destroy();reject(new Error('timeout'));});
+      req.on('error',reject);
       if (body) req.write(body);
       req.end();
     });
-
-    return { data: safeJson(text) ?? text, status: 200, headers: {}, statusText: 'OK' };
+    return { data: safeJson(text)??text, status:200, headers:{}, statusText:'OK' };
   };
-
-  const ax = (cfg) => request(cfg);
-  ax.get     = (url, cfg) => request({ url, method:'GET',    ...(cfg||{}) });
-  ax.post    = (url, data, cfg) => request({ url, method:'POST',   data, ...(cfg||{}) });
-  ax.put     = (url, data, cfg) => request({ url, method:'PUT',    data, ...(cfg||{}) });
-  ax.delete  = (url, cfg) => request({ url, method:'DELETE', ...(cfg||{}) });
-  ax.patch   = (url, data, cfg) => request({ url, method:'PATCH',  data, ...(cfg||{}) });
-  ax.head    = (url, cfg) => request({ url, method:'HEAD',   ...(cfg||{}) });
-  ax.create  = (defaults) => {
-    const inst = (cfg) => request({ ...defaults, ...cfg, url: (defaults?.baseURL||'') + (cfg?.url||'') });
-    Object.assign(inst, ax);
-    inst.defaults = { ...ax.defaults, ...defaults };
-    return inst;
+  const ax = (c)=>request(c);
+  ax.get    = (url,c)=>request({url,method:'GET',...(c||{})});
+  ax.post   = (url,d,c)=>request({url,method:'POST',data:d,...(c||{})});
+  ax.put    = (url,d,c)=>request({url,method:'PUT',data:d,...(c||{})});
+  ax.delete = (url,c)=>request({url,method:'DELETE',...(c||{})});
+  ax.patch  = (url,d,c)=>request({url,method:'PATCH',data:d,...(c||{})});
+  ax.create = (def)=>{
+    const inst=(c)=>request({...def,...c,url:(def?.baseURL||'')+(c?.url||'')});
+    return Object.assign(inst,ax,{defaults:{...ax.defaults,...def}});
   };
-  ax.defaults     = { baseURL:'', headers:{ common:{} } };
-  ax.interceptors = { request:{ use:()=>{} }, response:{ use:()=>{} } };
-  ax.isAxiosError = () => false;
-  ax.CanceledError = class CanceledError extends Error {};
-  ax.all     = Promise.all.bind(Promise);
-  ax.spread  = (fn) => (arr) => fn(...arr);
+  ax.defaults={baseURL:'',headers:{common:{}}};
+  ax.interceptors={request:{use:()=>{}},response:{use:()=>{}}};
+  ax.isAxiosError=()=>false;
+  ax.all=Promise.all.bind(Promise);
+  ax.spread=(fn)=>(arr)=>fn(...arr);
   return ax;
 })();
 
-// ─── Load a provider in a sandboxed vm ───────────────────────────────────────
-function loadProvider(code, id) {
+// ─── Load a provider from local disk into a sandboxed vm ─────────────────────
+function loadProvider(filename, id) {
+  const filePath = path.join(PROVIDERS_DIR, filename);
+  const code     = fs.readFileSync(filePath, 'utf-8');
+
   const fakeRequire = (mod) => {
     const map = {
       'cheerio-without-node-native': CHEERIO_SHIM,
@@ -340,108 +239,69 @@ function loadProvider(code, id) {
   const module_ = { exports };
 
   vm.runInContext(code, vm.createContext({
-    require: fakeRequire,
-    module:  module_,
-    exports,
-    console,
-    fetch,
-    Promise,
+    require: fakeRequire, module: module_, exports,
+    console, fetch, Promise,
     setTimeout, clearTimeout, setInterval, clearInterval,
-    Buffer, process,
-    URL, URLSearchParams,
-    TextEncoder, TextDecoder,
-    atob: (s) => Buffer.from(s, 'base64').toString('binary'),
-    btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
+    Buffer, process, URL, URLSearchParams, TextEncoder, TextDecoder,
+    atob: (s)=>Buffer.from(s,'base64').toString('binary'),
+    btoa: (s)=>Buffer.from(s,'binary').toString('base64'),
     global: {},
   }), { filename: `${id}.js`, timeout: 8000 });
 
   return module_.exports;
 }
 
-// ─── Fetch & deduplicate providers from all repos ─────────────────────────────
-async function loadAll() {
-  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  Loading providers from all repos...');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+// ─── Load all providers from disk ────────────────────────────────────────────
+function loadAllProviders() {
+  const manifestPath = path.join(PROVIDERS_DIR, 'manifest.json');
 
-  // Fetch all manifests in parallel
-  const manifests = await Promise.allSettled(
-    REPOS.map(repo =>
-      httpGet(repo.manifestUrl)
-        .then(text => ({ repo, parsed: safeJson(text) }))
-    )
-  );
-
-  // Deduplicate: first repo to claim an ID wins
-  const seen      = new Map();  // normalised id → { meta, repo }
-  const loadQueue = [];         // { meta, repo, normId }
-
-  for (const result of manifests) {
-    if (result.status === 'rejected') {
-      console.warn(`  ⚠️  Failed to fetch manifest:`, result.reason?.message);
-      continue;
-    }
-    const { repo, parsed } = result.value;
-    if (!parsed) { console.warn(`  ⚠️  Bad JSON from ${repo.name}`); continue; }
-
-    const scrapers = Array.isArray(parsed) ? parsed : (parsed.scrapers || []);
-    let added = 0, skipped = 0;
-
-    for (const entry of scrapers) {
-      if (!entry.enabled) continue;
-      const normId = (entry.id || '').toLowerCase().trim();
-      if (!normId) continue;
-
-      if (seen.has(normId)) {
-        skipped++;
-      } else {
-        seen.set(normId, { meta: entry, repo });
-        loadQueue.push({ meta: entry, repo, normId });
-        added++;
-      }
-    }
-    console.log(`  📋  ${repo.name}: ${added} unique, ${skipped} duplicate(s) skipped`);
+  if (!fs.existsSync(manifestPath)) {
+    console.error('❌  providers/manifest.json not found!');
+    console.error('   Run:  node build.js   first');
+    process.exit(1);
   }
 
-  console.log(`\n  🔄  Loading ${loadQueue.length} unique providers...\n`);
+  const list = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+  console.log(`\n📂  Loading ${list.length} providers from disk...\n`);
 
-  // Fetch & vm-load in batches of 6
   const loaded = [];
 
-  for (let i = 0; i < loadQueue.length; i += 6) {
-    const batch = loadQueue.slice(i, i + 6);
-    await Promise.all(batch.map(async ({ meta, repo, normId }) => {
-      const fileUrl = `${repo.base}/${meta.filename}`;
-      try {
-        const code = await httpGet(fileUrl, {}, 20000);
-        const mod  = loadProvider(code, normId);
-        if (typeof mod.getStreams !== 'function') {
-          console.warn(`  ⚠️  ${meta.name} [${repo.name}]: no getStreams()`);
-          return;
-        }
-        loaded.push({ meta, repo, getStreams: mod.getStreams });
-        console.log(`  ✅  ${meta.name.padEnd(24)} [${repo.name}]`);
-      } catch (e) {
-        console.error(`  ❌  ${meta.name} [${repo.name}]: ${e.message}`);
+  for (const entry of list) {
+    const filename = path.basename(entry.filename);
+    const filePath = path.join(PROVIDERS_DIR, filename);
+
+    if (!fs.existsSync(filePath)) {
+      console.warn(`  ⚠️  ${entry.name}: file missing (${filename}), skipping`);
+      continue;
+    }
+
+    try {
+      const mod = loadProvider(filename, entry.id);
+      if (typeof mod.getStreams !== 'function') {
+        console.warn(`  ⚠️  ${entry.name}: no getStreams() export`);
+        continue;
       }
-    }));
+      loaded.push({ meta: entry, getStreams: mod.getStreams });
+      console.log(`  ✅  ${entry.name.padEnd(26)} [${entry._repo}]`);
+    } catch (e) {
+      console.error(`  ❌  ${entry.name}: ${e.message}`);
+    }
   }
 
-  console.log(`\n  🎬  ${loaded.length} providers ready\n`);
+  console.log(`\n🎬  ${loaded.length} / ${list.length} providers loaded\n`);
 
-  // Build Stremio manifest
   const types = [...new Set(
-    loaded.flatMap(p => (p.meta.supportedTypes || ['movie','tv'])
-      .map(t => t === 'tv' || t === 'anime' ? 'series' : t)
+    loaded.flatMap(p => (p.meta.supportedTypes||['movie','tv'])
+      .map(t => t==='tv'||t==='anime' ? 'series' : t)
       .filter(t => ['movie','series'].includes(t))
     )
   )];
 
   const meta = {
     id          : 'community.nuvio.mega.bridge',
-    version     : '1.0.0',
+    version     : '2.0.0',
     name        : 'Nuvio Mega Bridge',
-    description : `${loaded.length} providers from 6 repos: ${REPOS.map(r=>r.name).join(', ')}`,
+    description : `${loaded.length} providers from 6 repos — all bundled locally`,
     logo        : 'https://raw.githubusercontent.com/yoruix/nuvio-providers/main/Assets/Logo-2.png',
     resources   : ['stream'],
     types       : types.length ? types : ['movie','series'],
@@ -453,66 +313,43 @@ async function loadAll() {
   return { loaded, meta };
 }
 
-// ─── Provider cache management ────────────────────────────────────────────────
-async function ensureProviders() {
+// ─── Ensure providers loaded (hot-reload every 6h without restart) ────────────
+function ensureProviders() {
   if (providers && (Date.now() - lastLoad) < PROVIDER_CACHE_TTL_MS) return;
-  if (loadPromise) return loadPromise;
-
-  loadPromise = loadAll()
-    .then(({ loaded, meta }) => {
-      providers   = loaded;
-      stremioMeta = meta;
-      lastLoad    = Date.now();
-      loadPromise = null;
-    })
-    .catch((e) => {
-      console.error('Fatal load error:', e.message);
-      if (!providers) providers = [];
-      loadPromise = null;
-    });
-
-  return loadPromise;
+  console.log('🔄  (Re)loading provider modules from disk...');
+  const { loaded, meta } = loadAllProviders();
+  providers   = loaded;
+  stremioMeta = meta;
+  lastLoad    = Date.now();
 }
 
 // ─── Parse Stremio ID ─────────────────────────────────────────────────────────
 function parseId(type, id) {
   const parts = id.split(':');
-  let tmdbId, season = null, episode = null;
-
-  if (type === 'series') {
-    if (parts[0] === 'tmdb') {
-      tmdbId  = parts[1];
-      season  = parseInt(parts[2], 10);
-      episode = parseInt(parts[3], 10);
-    } else {
-      tmdbId  = parts[0];
-      season  = parseInt(parts[1], 10);
-      episode = parseInt(parts[2], 10);
-    }
+  let tmdbId, season=null, episode=null;
+  if (type==='series') {
+    if (parts[0]==='tmdb') { tmdbId=parts[1]; season=+parts[2]; episode=+parts[3]; }
+    else { tmdbId=parts[0]; season=+parts[1]; episode=+parts[2]; }
   } else {
-    tmdbId = parts[0] === 'tmdb' ? parts[1] : parts[0];
+    tmdbId = parts[0]==='tmdb' ? parts[1] : parts[0];
   }
-
-  return { tmdbId, mediaType: type === 'series' ? 'tv' : 'movie', season, episode };
+  return { tmdbId, mediaType: type==='series'?'tv':'movie', season, episode };
 }
 
-// ─── Query providers (with cache + in-flight dedup) ───────────────────────────
+// ─── Query providers (cached + in-flight dedup) ───────────────────────────────
 async function getStreams(type, id) {
-  const key = makeCacheKey(type, id);
-
-  // 1. Cache hit or in-flight dedup
+  const key    = makeCacheKey(type, id);
   const cached = cacheGet(key);
+
   if (cached !== null) {
     if (cached instanceof Promise) {
-      // Another request is already scraping this title — wait for it
-      console.log(`⏳  ${type}/${id} — waiting on in-flight scrape`);
+      console.log(`⏳  ${type}/${id} — joining in-flight scrape`);
       return cached;
     }
     console.log(`⚡  ${type}/${id} — cache hit (${streamCache.get(key)?.hits} hits)`);
     return cached;
   }
 
-  // 2. Cache miss — start scraping, register in-flight promise immediately
   const { tmdbId, mediaType, season, episode } = parseId(type, id);
   console.log(`🔍  ${mediaType} | ${tmdbId} | S${season??'-'}E${episode??'-'} | ${providers.length} providers`);
 
@@ -521,7 +358,7 @@ async function getStreams(type, id) {
       providers.map(p =>
         Promise.race([
           p.getStreams(tmdbId, mediaType, season, episode),
-          new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 25000)),
+          new Promise((_,rej) => setTimeout(()=>rej(new Error('timeout')), 25000)),
         ])
       )
     );
@@ -529,8 +366,8 @@ async function getStreams(type, id) {
     const streams = [];
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
-      if (r.status === 'rejected') continue;
-      for (const s of (r.value || [])) {
+      if (r.status==='rejected') continue;
+      for (const s of (r.value||[])) {
         if (!s?.url) continue;
         const stream = {
           name  : s.name  || providers[i].meta.name,
@@ -538,25 +375,19 @@ async function getStreams(type, id) {
           url   : s.url,
         };
         if (s.headers && Object.keys(s.headers).length) {
-          stream.behaviorHints = {
-            notWebReady  : true,
-            proxyHeaders : { request: s.headers },
-          };
+          stream.behaviorHints = { notWebReady:true, proxyHeaders:{ request:s.headers } };
         }
         streams.push(stream);
       }
     }
 
-    // Promote from in-flight → cached result
     cacheSetResult(key, streams);
-    console.log(`  → ${streams.length} stream(s) | cache: ${streamCache.size} entries, ${cacheStats.hits} hits / ${cacheStats.misses} misses\n`);
+    const total   = cacheStats.hits + cacheStats.misses;
+    const hitRate = total ? ((cacheStats.hits/total)*100).toFixed(1)+'%' : '0%';
+    console.log(`  → ${streams.length} stream(s) | cache ${streamCache.size} entries, hit rate ${hitRate}\n`);
     return streams;
-  })().catch((e) => {
-    cacheClearInflight(key);
-    throw e;
-  });
+  })().catch(e => { cacheClearInflight(key); throw e; });
 
-  // Register in-flight so concurrent requests share this promise
   cacheSetInflight(key, scrapePromise);
   return scrapePromise;
 }
@@ -564,72 +395,60 @@ async function getStreams(type, id) {
 // ─── HTTP server ──────────────────────────────────────────────────────────────
 function json(res, status, data) {
   res.writeHead(status, {
-    'Content-Type'                : 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin' : '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Content-Type'                :'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin' :'*',
+    'Access-Control-Allow-Methods':'GET, OPTIONS',
+    'Access-Control-Allow-Headers':'Content-Type',
   });
   res.end(JSON.stringify(data));
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Origin':'*', 'Access-Control-Allow-Methods':'GET,OPTIONS' });
-    res.end();
-    return;
+  if (req.method==='OPTIONS') {
+    res.writeHead(204,{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,OPTIONS'});
+    res.end(); return;
   }
 
   const url = req.url.split('?')[0];
 
-  if (url === '/') {
-    res.writeHead(200, { 'Content-Type':'text/plain' });
-    res.end('Nuvio Mega Bridge — add /manifest.json to Stremio');
+  if (url==='/') {
+    res.writeHead(200,{'Content-Type':'text/plain'});
+    res.end(`Nuvio Mega Bridge v2 — ${providers?.length??0} providers loaded\nAdd to Stremio: /manifest.json`);
     return;
   }
 
-  // Cache stats endpoint
-  if (url === '/cache') {
+  if (url==='/manifest.json') {
+    ensureProviders();
+    json(res, 200, stremioMeta);
+    return;
+  }
+
+  if (url==='/cache') {
     const now = Date.now();
     const entries = [...streamCache.entries()]
-      .filter(([, v]) => !v.promise)
-      .map(([k, v]) => ({
-        key      : k,
-        hits     : v.hits,
-        expiresIn: Math.round((v.expiresAt - now) / 1000) + 's',
-      }))
-      .sort((a, b) => b.hits - a.hits);
-
+      .filter(([,v])=>!v.promise)
+      .map(([k,v])=>({ key:k, hits:v.hits, expiresIn:Math.round((v.expiresAt-now)/1000)+'s' }))
+      .sort((a,b)=>b.hits-a.hits);
+    const total = cacheStats.hits + cacheStats.misses;
     json(res, 200, {
-      summary: {
-        totalEntries  : streamCache.size,
-        cacheHits     : cacheStats.hits,
-        cacheMisses   : cacheStats.misses,
-        evictions     : cacheStats.evictions,
-        hitRate       : cacheStats.hits + cacheStats.misses > 0
-                          ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
-                          : '0%',
-        ttlMinutes    : STREAM_CACHE_TTL_MS / 60000,
-        maxEntries    : STREAM_CACHE_MAX,
+      summary:{
+        totalEntries:streamCache.size, cacheHits:cacheStats.hits,
+        cacheMisses:cacheStats.misses, evictions:cacheStats.evictions,
+        hitRate: total ? ((cacheStats.hits/total)*100).toFixed(1)+'%' : '0%',
+        ttlHours: STREAM_CACHE_TTL_MS/3600000, maxEntries:STREAM_CACHE_MAX,
+        providersLoaded: providers?.length??0,
       },
-      topEntries: entries.slice(0, 20),
+      topEntries: entries.slice(0,20),
     });
-    return;
-  }
-
-  if (url === '/manifest.json') {
-    await ensureProviders();
-    if (!stremioMeta) { json(res, 503, { error:'Loading providers, retry in 30s' }); return; }
-    json(res, 200, stremioMeta);
     return;
   }
 
   const m = url.match(/^\/stream\/(movie|series)\/(.+)\.json$/);
   if (m) {
-    await ensureProviders();
-    if (!providers?.length) { json(res, 200, { streams:[] }); return; }
+    ensureProviders();
     try {
       json(res, 200, { streams: await getStreams(m[1], decodeURIComponent(m[2])) });
-    } catch (e) {
+    } catch(e) {
       console.error('Stream error:', e.message);
       json(res, 200, { streams:[] });
     }
@@ -639,20 +458,16 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { error:'Not found' });
 });
 
-server.listen(PORT, async () => {
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  🎬  Nuvio Mega Bridge — Stremio Addon');
-  console.log(`  📡  Port ${PORT}`);
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  await ensureProviders();
+server.listen(PORT, () => {
+  ensureProviders();
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  ✅  Add to Stremio:');
   console.log('  https://<your-railway-app>.up.railway.app/manifest.json');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 });
 
-server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') console.error(`❌  Port ${PORT} in use`);
+server.on('error', e => {
+  if (e.code==='EADDRINUSE') console.error(`❌  Port ${PORT} in use`);
   else console.error('Server error:', e);
   process.exit(1);
 });
